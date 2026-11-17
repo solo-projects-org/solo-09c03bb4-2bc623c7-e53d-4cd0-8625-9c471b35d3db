@@ -54,6 +54,8 @@ docker compose up --build
 | `POST /images` | 流式上传（随机编号）；`X-Idempotency-Token` 幂等；`X-Filename` 可选 |
 | `PUT /images/{image_id}` | 按调用方编号上传 |
 | `GET /images/{image_id}` | 按号下载，流式解密、逐帧 GCM 验签、SHA-256 校验 |
+| `DELETE /images/{image_id}` | 撤下原片（仅受理已发布；202 受理 / 200 已完成；同号重试幂等） |
+| `GET /images/{image_id}/deletion` | 撤下进度查询（state/envelope_erased/blob_removed） |
 | `GET /images/{image_id}/meta` | 元数据/状态（不返回信封密文） |
 | `GET /images` | 列表 |
 | `POST /rotations` | 发起主密钥轮换（body `{"confirm": true}`），返回 202 + job_id |
@@ -75,11 +77,35 @@ curl -sS -X PUT --data-binary @slide_001.czi \
 curl -sS http://localhost:8000/images/slide-001 -o /tmp/slide_001.czi
 sha256sum slide_001.czi /tmp/slide_001.czi
 
+# 撤下误收原片并跟进清退进度
+curl -sS -X DELETE http://localhost:8000/images/slide-001
+watch -n1 "curl -sS http://localhost:8000/images/slide-001/deletion"
+
 # 发起轮换 / 查进度
 JOB=$(curl -sS -X POST -H 'Content-Type: application/json' \
   -d '{"confirm":true}' http://localhost:8000/rotations | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
 watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
 ```
+
+## 撤下（删除）语义（需求对照）
+
+1. **仅受理已发布原片**：`DELETE /images/{id}` 只接受 `ready` 状态
+   （`receiving/failed` 返回 `409 image_not_published`，不存在返回 404）。
+2. **受理即禁新下载**：受理在同一事务内把状态翻为 `deleting` 并登记删除作业
+   （持久化），此后下载一律 `410 image_withdrawn`；**已经开始的流式下载**
+   已持有密文 fd 与内存 DEK，清退 unlink 文件不影响其完整读完（POSIX 语义）。
+3. **最终清除密文与信封**：后台清退线程先抹除可解包信封
+   （`wrapped_dek` 清空，密码学撤读），再删除密文 blob 回收空间；
+   **两项都落库后**作业才置 `completed`、行状态转 `deleted`。
+4. **进度可查、同号幂等**：删除作业持久化在 `deletions` 表，
+   `GET /images/{id}/deletion` 与重复 `DELETE` 都返回同一进度；
+   墓碑行永久占位，**旧编号再入仓返回 `409 image_id_retired`**。
+5. **与轮换交错**：撤下行不参与信封迁移（扫描与销毁统计均排除），
+   迁移写回有状态守卫——**已撤下的信封绝不会被 rewrap 写回**；
+   撤下行不阻塞旧 MK 销毁。删除清退不调用密钥服务，密钥服务慢/宕不影响清退。
+6. **故障接续**：受理后清退失败（删文件/改库异常）会记录 `attempts/error`
+   并持续重试；API 重启后后台线程自动接续未完成清退，
+   期间原片一直不可供数，文件与信封都清除后才报完成。
 
 ## 轮换语义（需求对照）
 
@@ -114,7 +140,7 @@ KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（30 项，含离线加密/元数据单测）
 python -m pytest tests/ -q
 ```
 
@@ -123,7 +149,9 @@ python -m pytest tests/ -q
 篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读）、
 进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
 双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
-跨越轮换的上传自动改绑。
+跨越轮换的上传自动改绑、**撤下全流程**（受理即禁下载/在途下载完整结束/
+信封与密文清除后才报完成/同号幂等/旧编号禁入仓/与轮换交错不写回不阻塞/
+重启接续/旧库结构迁移）。
 
 ## 限制与生产化建议（见 docs/ 下说明）
 

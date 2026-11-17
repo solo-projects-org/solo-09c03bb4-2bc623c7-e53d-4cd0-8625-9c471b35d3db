@@ -13,6 +13,8 @@
   T10 幂等上传令牌重放
   T11 轮换中途重启 API：作业自动接续到完成
   T12 篡改密文 -> GCM 验签失败
+（T13-T17 撤下/删除语义见 tests/test_deletion.py；元数据离线单测见
+  tests/test_metadata_unit.py）
 """
 from __future__ import annotations
 

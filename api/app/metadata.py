@@ -12,15 +12,17 @@ import time
 import uuid
 from typing import Any, Iterator
 
-SCHEMA = """
+# images 表结构（v2：status 增加 deleting/deleted 两个撤下态）。
+# 单独抽成常量：旧库迁移需要按同一结构重建表（SQLite 无法 ALTER CHECK）。
+IMAGES_DDL = """
 CREATE TABLE IF NOT EXISTS images (
     image_id        TEXT PRIMARY KEY,
     filename        TEXT,
     content_type    TEXT,
     status          TEXT NOT NULL CHECK (status IN
-                        ('receiving','ready','failed')),
+                        ('receiving','ready','failed','deleting','deleted')),
     master_key_id   TEXT NOT NULL,
-    wrapped_dek     TEXT NOT NULL,           -- 十六进制信封，始终为密文
+    wrapped_dek     TEXT NOT NULL,           -- 十六进制信封，始终为密文；撤下后清空
     blob_path       TEXT NOT NULL,
     plain_size      INTEGER,
     enc_size        INTEGER,
@@ -30,8 +32,26 @@ CREATE TABLE IF NOT EXISTS images (
     created_at      REAL NOT NULL,
     finalized_at    REAL
 );
+"""
+
+SCHEMA = IMAGES_DDL + """
 CREATE INDEX IF NOT EXISTS idx_images_mk ON images(master_key_id);
 CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
+
+-- 撤下（删除）作业：受理即持久化，清退步骤幂等可续作；
+-- 行保留即"删除进度"，供同编号重试查询，且墓碑行使旧编号永不可再入仓。
+CREATE TABLE IF NOT EXISTS deletions (
+    image_id         TEXT PRIMARY KEY,
+    state            TEXT NOT NULL CHECK (state IN
+                         ('pending','clearing','completed')),
+    envelope_erased  INTEGER NOT NULL DEFAULT 0,   -- 可解包信封已抹除
+    blob_removed     INTEGER NOT NULL DEFAULT 0,   -- 密文文件已删除
+    attempts         INTEGER NOT NULL DEFAULT 0,   -- 清退步骤失败重试次数
+    error            TEXT,
+    requested_at     REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    finished_at      REAL
+);
 
 CREATE TABLE IF NOT EXISTS rotation_jobs (
     job_id          TEXT PRIMARY KEY,
@@ -61,9 +81,34 @@ class MetadataDB:
         self._write_lock = threading.RLock()
         self._local = threading.local()
         conn = self._connect()
+        self._migrate_images_status_check(conn)
         conn.executescript(SCHEMA)
         conn.commit()
         conn.close()
+
+    def _migrate_images_status_check(self, conn: sqlite3.Connection) -> None:
+        """旧库 images.status 的 CHECK 不含撤下态：重建表迁移（列结构不变）。
+
+        SQLite 不能修改 CHECK 约束；数据量小（元数据行），重建代价可忽略。
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='images'"
+        ).fetchone()
+        if row is None or "'deleting'" in row["sql"]:
+            return  # 新库（尚未建表）或已是新结构
+        with self._write_lock:
+            conn.executescript(
+                "BEGIN;\n"
+                + IMAGES_DDL.replace("IF NOT EXISTS images", "IF NOT EXISTS images_mig")
+                + """
+INSERT INTO images_mig SELECT image_id, filename, content_type, status,
+    master_key_id, wrapped_dek, blob_path, plain_size, enc_size, sha256,
+    idem_token, error, created_at, finalized_at FROM images;
+DROP TABLE images;
+ALTER TABLE images_mig RENAME TO images;
+COMMIT;
+""")
+        print("[startup] migrated images table schema for deletion states")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=30,
@@ -95,13 +140,17 @@ class MetadataDB:
                 if existing:
                     return existing["image_id"]
             now = time.time()
-            self.conn.execute(
-                "INSERT INTO images (image_id, filename, content_type, status, "
-                "master_key_id, wrapped_dek, blob_path, idem_token, created_at) "
-                "VALUES (?,?,?, 'receiving', ?,?,?,?,?)",
-                (image_id, filename, content_type, master_key_id,
-                 wrapped_dek, blob_path, idem_token, now))
-            self.conn.commit()
+            try:
+                self.conn.execute(
+                    "INSERT INTO images (image_id, filename, content_type, status, "
+                    "master_key_id, wrapped_dek, blob_path, idem_token, created_at) "
+                    "VALUES (?,?,?, 'receiving', ?,?,?,?,?)",
+                    (image_id, filename, content_type, master_key_id,
+                     wrapped_dek, blob_path, idem_token, now))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()  # 失败 INSERT 不留悬挂事务
+                raise
             return image_id
 
     def get_image(self, image_id: str) -> dict[str, Any] | None:
@@ -163,15 +212,17 @@ class MetadataDB:
 
     def rewrap_row(self, image_id: str, expect_old_key: str,
                    new_key_id: str, new_wrapped: str) -> bool:
-        """条件更新：仅当该行仍绑定旧 MK 时改包，返回是否实际更新。
+        """条件更新：仅当该行仍绑定旧 MK 且仍在供数状态时改包，返回是否实际更新。
 
         这样迁移与"迟到的在途上传最终化"互不覆盖：后者若已自行改绑新 MK，
-        迁移跳过它即可。
+        迁移跳过它即可。状态守卫保证：已撤下（deleting/deleted）的行绝不会
+        被轮换迁移写回信封——撤下后的信封只能被删除清退抹除。
         """
         with self._write_lock:
             cur = self.conn.execute(
                 "UPDATE images SET master_key_id=?, wrapped_dek=? "
-                "WHERE image_id=? AND master_key_id=?",
+                "WHERE image_id=? AND master_key_id=? "
+                "AND status IN ('ready','receiving')",
                 (new_key_id, new_wrapped, image_id, expect_old_key))
             self.conn.commit()
             return cur.rowcount > 0
@@ -186,6 +237,83 @@ class MetadataDB:
                 "WHERE status='receiving'", (time.time(),))
             self.conn.commit()
             return cur.rowcount
+
+    # ---- 撤下（删除） ---------------------------------------------------
+    def accept_deletion(self, image_id: str) -> bool:
+        """受理撤下：ready -> deleting 并同事务登记删除作业。
+
+        条件 UPDATE 保证只有已发布（ready）行被受理；受理一旦落库，
+        下载门（status=='ready'）立即关闭，且重启后清退可接续。
+        返回是否本次受理成功（并发重复受理时只有一个成功）。
+        """
+        with self._write_lock:
+            now = time.time()
+            cur = self.conn.execute(
+                "UPDATE images SET status='deleting' "
+                "WHERE image_id=? AND status='ready'", (image_id,))
+            if cur.rowcount == 0:
+                self.conn.rollback()
+                return False
+            self.conn.execute(
+                "INSERT INTO deletions (image_id, state, requested_at, "
+                "updated_at) VALUES (?, 'pending', ?, ?)",
+                (image_id, now, now))
+            self.conn.commit()
+            return True
+
+    def get_deletion(self, image_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM deletions WHERE image_id=?", (image_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_pending_deletions(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM deletions WHERE state != 'completed' "
+            "ORDER BY requested_at").fetchall()
+        return [dict(r) for r in rows]
+
+    def erase_envelope(self, image_id: str) -> None:
+        """抹除可解包信封（wrapped_dek 清空）并同事务标记进度。
+
+        此后该原片在密码学上不可再被解包（即使旧 MK 仍存活）；
+        行仍保留为墓碑，旧编号不可再入仓。
+        """
+        with self._write_lock:
+            now = time.time()
+            self.conn.execute(
+                "UPDATE images SET wrapped_dek='' "
+                "WHERE image_id=? AND status='deleting'", (image_id,))
+            self.conn.execute(
+                "UPDATE deletions SET envelope_erased=1, state='clearing', "
+                "updated_at=? WHERE image_id=?", (now, image_id))
+            self.conn.commit()
+
+    def mark_blob_removed(self, image_id: str) -> None:
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE deletions SET blob_removed=1, state='clearing', "
+                "updated_at=? WHERE image_id=?", (time.time(), image_id))
+            self.conn.commit()
+
+    def complete_deletion(self, image_id: str) -> None:
+        """信封与密文文件都已清除后才置终态：行转 deleted，作业 completed。"""
+        with self._write_lock:
+            now = time.time()
+            self.conn.execute(
+                "UPDATE images SET status='deleted' "
+                "WHERE image_id=? AND status='deleting'", (image_id,))
+            self.conn.execute(
+                "UPDATE deletions SET state='completed', updated_at=?, "
+                "finished_at=? WHERE image_id=?", (now, now, image_id))
+            self.conn.commit()
+
+    def bump_deletion_attempt(self, image_id: str, error: str) -> None:
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE deletions SET attempts=attempts+1, error=?, "
+                "updated_at=? WHERE image_id=?",
+                (error[:500], time.time(), image_id))
+            self.conn.commit()
 
     # ---- 轮换作业 -------------------------------------------------------
     def active_rotation(self) -> dict | None:

@@ -48,8 +48,25 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 | API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布）；blob 残片可按 failed 行清理 |
 | API 在轮换中崩溃 | 重启后后台线程自动接续未完成作业到终态 |
 | 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业 |
+| API 在撤下清退中崩溃 | 重启后清退线程自动接续；期间原片一直 410 不可供数，信封与密文都清除后才报 completed |
 | 密钥服务重启 | 主密钥从卷内 SQLite 恢复，已入湖原片逐字节可读 |
 | 销毁回执丢失 | KeyClient 重试并以 `/internal/master/status` 只读核实 |
+
+## 5.1 撤下（删除）运维
+
+- `DELETE /images/{id}` 仅受理 `ready` 原片；受理即 202 且新下载立即 410。
+  清退进度查 `GET /images/{id}/deletion`（`pending/clearing/completed`，
+  含 `envelope_erased`、`blob_removed`、`attempts`、`error`）。
+- 清退顺序：先抹除可解包信封（`wrapped_dek` 清空），再删除密文 blob；
+  两步都完成才置 `completed`、行转 `deleted`。中途失败会持续重试并
+  累计 `attempts`，无需人工重发；若长期卡在 `clearing`，按 `error`
+  字段排查（通常是 blob 目录文件系统故障）。
+- 撤下是**不可逆**的：信封抹除后即使旧 MK 仍在也无法解包；墓碑行永久
+  占位，同编号再入仓返回 `409 image_id_retired`。
+- 撤下行不参与轮换迁移、不阻塞旧 MK 销毁；清退不调用密钥服务，
+  密钥服务不可用不影响清退推进。
+- 已开始下载的原片在撤下后仍能完整读完（下载 fd 在 unlink 前已打开）；
+  如需立即停发，请在网关侧断开连接。
 
 ## 6. 已知限制（单实例/SQLite 范围之外）
 
